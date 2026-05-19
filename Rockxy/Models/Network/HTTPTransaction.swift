@@ -57,6 +57,8 @@ final class HTTPTransaction: Identifiable, @unchecked Sendable {
     var matchedRuleName: String?
     var matchedRuleActionSummary: String?
     var matchedRulePattern: String?
+    var upstreamProxySummary: String?
+    var upstreamProxyKind: String?
 
     /// Request-list ordering metadata. Tracks the order this transaction was received by
     /// the coordinator, independent of `timestamp`. Used only for the request-list "row #"

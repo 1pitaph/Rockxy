@@ -97,6 +97,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         connectionLimiter: ConnectionLimiter,
         sslProxyingManager: SSLProxyingManager = .shared,
         customCertificateManager: CustomCertificateManager = .shared,
+        upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         clientSourcePort: UInt16? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
@@ -109,6 +110,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         self.connectionLimiter = connectionLimiter
         self.sslProxyingManager = sslProxyingManager
         self.customCertificateManager = customCertificateManager
+        self.upstreamProxyState = upstreamProxyState
         self.clientSourcePort = clientSourcePort
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
@@ -127,7 +129,9 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         state: TransactionState,
         sourcePort: UInt16?,
         measuredDuration: TimeInterval? = nil,
-        isTLSFailure: Bool = false
+        isTLSFailure: Bool = false,
+        upstreamRouteSummary: String? = nil,
+        upstreamRouteKind: String? = nil
     )
         -> HTTPTransaction
     {
@@ -152,7 +156,9 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                 state: state,
                 sourcePort: sourcePort,
                 measuredDuration: measuredDuration,
-                isTLSFailure: isTLSFailure
+                isTLSFailure: isTLSFailure,
+                upstreamRouteSummary: upstreamRouteSummary,
+                upstreamRouteKind: upstreamRouteKind
             )
         }
         let requestData = HTTPRequestData(
@@ -175,6 +181,8 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         transaction.measuredDuration = measuredDuration
         transaction.sourcePort = sourcePort
         transaction.isTLSFailure = isTLSFailure
+        transaction.upstreamProxySummary = upstreamRouteSummary
+        transaction.upstreamProxyKind = upstreamRouteKind
         return transaction
     }
 
@@ -234,6 +242,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
     private let connectionLimiter: ConnectionLimiter
     private let sslProxyingManager: SSLProxyingManager
     private let customCertificateManager: CustomCertificateManager
+    private let upstreamProxyState: UpstreamProxyState
     private let clientSourcePort: UInt16?
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
@@ -269,6 +278,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         let scriptPluginManager = self.scriptPluginManager
         let sourcePort = self.clientSourcePort
         let breakpointHit = self.onBreakpointHit
+        let upstreamProxyState = self.upstreamProxyState
 
         let certFuture: EventLoopFuture<CustomTLSIdentity> =
             eventLoop.makeFutureWithTask {
@@ -301,6 +311,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                     ruleEngine: ruleEngine,
                     scriptPluginManager: scriptPluginManager,
                     callback: callback,
+                    upstreamProxyState: upstreamProxyState,
                     breakpointHit: breakpointHit
                 )
             case let .failure(error):
@@ -318,6 +329,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         ruleEngine: RuleEngine,
         scriptPluginManager: ScriptPluginManager?,
         callback: @escaping @Sendable (HTTPTransaction) -> Void,
+        upstreamProxyState: UpstreamProxyState,
         breakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
     ) {
         guard !identity.certificateChainPEM.isEmpty, !identity.privateKeyPEM.isEmpty else {
@@ -338,6 +350,7 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                 connectionLimiter: self.connectionLimiter,
                 sslProxyingManager: self.sslProxyingManager,
                 customCertificateManager: self.customCertificateManager,
+                upstreamProxyState: upstreamProxyState,
                 clientSourcePort: self.clientSourcePort,
                 onTransactionComplete: callback,
                 onBreakpointHit: breakpointHit
@@ -348,7 +361,8 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                 host: host,
                 port: port,
                 postHandshake: postHandshake,
-                connectionLimiter: self.connectionLimiter
+                connectionLimiter: self.connectionLimiter,
+                upstreamProxyState: upstreamProxyState
             )
 
             let pipeline = context.pipeline
@@ -415,12 +429,37 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         }
         let limiter = connectionLimiter
 
-        ClientBootstrap(group: context.eventLoop)
-            .connectTimeout(.seconds(5))
-            .connect(host: host, port: port)
+        let routes: [UpstreamRoute]
+        do {
+            routes = try upstreamProxyState.routes(for: host, port: port, scheme: "https")
+        } catch {
+            limiter.release(host: host, port: port)
+            tlsLogger.error("Raw tunnel route resolution failed for \(host):\(port): \(error.localizedDescription)")
+            onTransactionComplete(
+                Self.makeTunnelTransaction(
+                    host: host,
+                    port: port,
+                    statusCode: 502,
+                    statusMessage: "Upstream Route Failed",
+                    state: .failed,
+                    sourcePort: clientSourcePort,
+                    measuredDuration: tunnelElapsedDuration()
+                )
+            )
+            context.close(promise: nil)
+            return
+        }
+
+        UpstreamConnector.connectRawTunnel(
+            on: context.eventLoop,
+            targetHost: host,
+            targetPort: port,
+            routes: routes
+        )
             .whenComplete { result in
                 switch result {
-                case let .success(serverChannel):
+                case let .success(connection):
+                    let serverChannel = connection.channel
                     serverChannel.closeFuture.whenComplete { _ in
                         limiter.release(host: host, port: port)
                     }
@@ -439,7 +478,9 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                                 statusMessage: "Connection Established",
                                 state: .completed,
                                 sourcePort: self.clientSourcePort,
-                                measuredDuration: self.tunnelElapsedDuration()
+                                measuredDuration: self.tunnelElapsedDuration(),
+                                upstreamRouteSummary: connection.route.summary,
+                                upstreamRouteKind: connection.route.kindDisplay
                             )
                         )
                     } onFailure: { error in
@@ -482,6 +523,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         connectionLimiter: ConnectionLimiter,
         sslProxyingManager: SSLProxyingManager,
         customCertificateManager: CustomCertificateManager = .shared,
+        upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         clientSourcePort: UInt16? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
@@ -493,6 +535,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         self.connectionLimiter = connectionLimiter
         self.sslProxyingManager = sslProxyingManager
         self.customCertificateManager = customCertificateManager
+        self.upstreamProxyState = upstreamProxyState
         self.clientSourcePort = clientSourcePort
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
@@ -517,6 +560,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
                 scriptPluginManager: scriptPluginManager,
                 connectionLimiter: connectionLimiter,
                 customCertificateManager: customCertificateManager,
+                upstreamProxyState: upstreamProxyState,
                 clientSourcePort: clientSourcePort,
                 onTransactionComplete: onTransactionComplete,
                 onBreakpointHit: onBreakpointHit
@@ -590,7 +634,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         tearDownAndPassthrough(context: context)
     }
 
-    nonisolated func makeSuccessfulTunnelTransaction() -> HTTPTransaction {
+    nonisolated func makeSuccessfulTunnelTransaction(upstreamRoute: UpstreamRoute? = nil) -> HTTPTransaction {
         TLSInterceptHandler.makeTunnelTransaction(
             host: host,
             port: port,
@@ -598,12 +642,14 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
             statusMessage: "Connection Established",
             state: .completed,
             sourcePort: clientSourcePort,
-            measuredDuration: tunnelElapsedDuration()
+            measuredDuration: tunnelElapsedDuration(),
+            upstreamRouteSummary: upstreamRoute?.summary,
+            upstreamRouteKind: upstreamRoute?.kindDisplay
         )
     }
 
-    nonisolated func recordSuccessfulTunnel() {
-        onTransactionComplete(makeSuccessfulTunnelTransaction())
+    nonisolated func recordSuccessfulTunnel(upstreamRoute: UpstreamRoute? = nil) {
+        onTransactionComplete(makeSuccessfulTunnelTransaction(upstreamRoute: upstreamRoute))
     }
 
     // MARK: Private
@@ -617,6 +663,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
     private let connectionLimiter: ConnectionLimiter
     private let sslProxyingManager: SSLProxyingManager
     private let customCertificateManager: CustomCertificateManager
+    private let upstreamProxyState: UpstreamProxyState
     private let clientSourcePort: UInt16?
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
@@ -655,6 +702,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         let port = self.port
         let channel = context.channel
         let limiter = self.connectionLimiter
+        let upstreamProxyState = self.upstreamProxyState
 
         guard channel.isActive else {
             tlsLogger.debug("Channel already closed for \(host), skipping passthrough")
@@ -663,6 +711,18 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
 
         guard limiter.acquire(host: host, port: port) else {
             tlsLogger.warning("Connection limit reached for \(host):\(port), closing")
+            channel.close(promise: nil)
+            return
+        }
+
+        let routes: [UpstreamRoute]
+        do {
+            routes = try upstreamProxyState.routes(for: host, port: port, scheme: "https")
+        } catch {
+            limiter.release(host: host, port: port)
+            tlsLogger.warning(
+                "Current-connection passthrough route resolution failed for \(host): \(error.localizedDescription), closing"
+            )
             channel.close(promise: nil)
             return
         }
@@ -678,12 +738,16 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         }.flatMapError { _ in
             context.eventLoop.makeSucceededVoidFuture()
         }.flatMap {
-            ClientBootstrap(group: context.eventLoop)
-                .connectTimeout(.seconds(5))
-                .connect(host: host, port: port)
+            UpstreamConnector.connectRawTunnel(
+                on: context.eventLoop,
+                targetHost: host,
+                targetPort: port,
+                routes: routes
+            )
         }.whenComplete { result in
             switch result {
-            case let .success(serverChannel):
+            case let .success(connection):
+                let serverChannel = connection.channel
                 serverChannel.closeFuture.whenComplete { _ in
                     limiter.release(host: host, port: port)
                 }
@@ -692,7 +756,9 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
                     clientChannel: channel,
                     prepareClientChannel: channel.eventLoop.makeSucceededVoidFuture()
                 ) {
-                    tlsLogger.info("Current-connection passthrough established for \(host)")
+                    tlsLogger.info(
+                        "Current-connection passthrough established for \(host) via \(connection.route.summary, privacy: .public)"
+                    )
                 } onFailure: { _ in
                     serverChannel.close(promise: nil)
                     channel.close(promise: nil)
@@ -725,13 +791,15 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
         host: String,
         port: Int,
         postHandshake: PostHandshakeHandler,
-        connectionLimiter: ConnectionLimiter
+        connectionLimiter: ConnectionLimiter,
+        upstreamProxyState: UpstreamProxyState = UpstreamProxyState()
     ) {
         self.sslHandler = sslHandler
         self.host = host
         self.port = port
         self.postHandshake = postHandshake
         self.connectionLimiter = connectionLimiter
+        self.upstreamProxyState = upstreamProxyState
     }
 
     // MARK: Internal
@@ -784,6 +852,7 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
     private let port: Int
     private let postHandshake: PostHandshakeHandler
     private let connectionLimiter: ConnectionLimiter
+    private let upstreamProxyState: UpstreamProxyState
     private var detected = false
 
     /// Remove NIOSSLServerHandler and PostHandshakeHandler, then set up a raw TCP relay.
@@ -797,9 +866,20 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
         let sslHandler = self.sslHandler
         let postHandshake = self.postHandshake
         let limiter = self.connectionLimiter
+        let upstreamProxyState = self.upstreamProxyState
 
         guard limiter.acquire(host: host, port: port) else {
             tlsLogger.warning("Connection limit reached for \(host):\(port), closing")
+            channel.close(promise: nil)
+            return
+        }
+
+        let routes: [UpstreamRoute]
+        do {
+            routes = try upstreamProxyState.routes(for: host, port: port, scheme: "https")
+        } catch {
+            limiter.release(host: host, port: port)
+            tlsLogger.error("Raw tunnel route resolution failed to \(host):\(port): \(String(describing: error))")
             channel.close(promise: nil)
             return
         }
@@ -815,12 +895,16 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
         }.flatMap {
             pipeline.removeHandler(context: context)
         }.flatMap {
-            ClientBootstrap(group: context.eventLoop)
-                .connectTimeout(.seconds(5))
-                .connect(host: host, port: port)
+            UpstreamConnector.connectRawTunnel(
+                on: context.eventLoop,
+                targetHost: host,
+                targetPort: port,
+                routes: routes
+            )
         }.whenComplete { result in
             switch result {
-            case let .success(serverChannel):
+            case let .success(connection):
+                let serverChannel = connection.channel
                 serverChannel.closeFuture.whenComplete { _ in
                     limiter.release(host: host, port: port)
                 }
@@ -829,7 +913,7 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
                     clientChannel: channel,
                     prepareClientChannel: channel.eventLoop.makeSucceededVoidFuture()
                 ) {
-                    self.postHandshake.recordSuccessfulTunnel()
+                    self.postHandshake.recordSuccessfulTunnel(upstreamRoute: connection.route)
                     // Forward the first non-TLS data to the upstream once the raw tunnel is live.
                     channel.pipeline.fireChannelRead(firstData)
                     channel.pipeline.fireChannelReadComplete()

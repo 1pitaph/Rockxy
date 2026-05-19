@@ -33,6 +33,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
         scriptPluginManager: ScriptPluginManager? = nil,
         connectionLimiter: ConnectionLimiter,
         customCertificateManager: CustomCertificateManager = .shared,
+        upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
     ) {
@@ -41,6 +42,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
         self.scriptPluginManager = scriptPluginManager
         self.connectionLimiter = connectionLimiter
         self.customCertificateManager = customCertificateManager
+        self.upstreamProxyState = upstreamProxyState
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
     }
@@ -102,6 +104,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
     private let scriptPluginManager: ScriptPluginManager?
     private let connectionLimiter: ConnectionLimiter
     private let customCertificateManager: CustomCertificateManager
+    private let upstreamProxyState: UpstreamProxyState
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
         BreakpointDecision,
@@ -597,6 +600,7 @@ extension HTTPProxyHandler {
                 scriptPluginManager: self.scriptPluginManager,
                 connectionLimiter: self.connectionLimiter,
                 customCertificateManager: self.customCertificateManager,
+                upstreamProxyState: self.upstreamProxyState,
                 clientSourcePort: self.clientSourcePort,
                 onTransactionComplete: self.onTransactionComplete,
                 onBreakpointHit: self.onBreakpointHit
@@ -660,43 +664,38 @@ extension HTTPProxyHandler {
 
         let limiter = connectionLimiter
         let useTLS = requestData.url.scheme == "https"
-        ClientBootstrap(group: context.eventLoop)
-            .connectTimeout(.seconds(5))
-            .channelInitializer { channel in
-                if useTLS {
-                    do {
-                        let tlsConfig = try HTTPSProxyRelayHandler.makeClientTLSConfiguration(
-                            clientIdentity: self.customCertificateManager.clientIdentity(for: host)
-                        )
-                        let sslContext = try NIOSSLContext(configuration: tlsConfig)
-                        let sslHandler = try NIOSSLClientHandler(
-                            context: sslContext,
-                            serverHostname: host
-                        )
-                        return channel.pipeline.addHandler(sslHandler).flatMap {
-                            channel.pipeline.addHTTPClientHandlers()
-                        }
-                    } catch {
-                        return channel.eventLoop.makeFailedFuture(error)
-                    }
-                }
-                return channel.pipeline.addHTTPClientHandlers()
-            }
-            .connect(host: host, port: port)
+        let routes: [UpstreamRoute]
+        do {
+            routes = try upstreamProxyState.routes(for: host, port: port, scheme: requestData.url.scheme)
+        } catch {
+            proxyHandlerLogger.error("Upstream route resolution failed: \(error.localizedDescription)")
+            limiter.release(host: host, port: port)
+            sendErrorResponse(context: context, status: 502, requestData: requestData, callback: callback)
+            return
+        }
+
+        UpstreamConnector.connectHTTP(
+            on: context.eventLoop,
+            targetHost: host,
+            targetPort: port,
+            useTLS: useTLS,
+            routes: routes,
+            customCertificateManager: customCertificateManager
+        )
             .whenComplete { [weak self] result in
                 guard let self else {
-                    if case let .success(channel) = result {
-                        channel.close(promise: nil)
+                    if case let .success(connection) = result {
+                        connection.channel.close(promise: nil)
                     }
                     limiter.release(host: host, port: port)
                     return
                 }
                 switch result {
-                case let .success(clientChannel):
+                case let .success(connection):
                     let tcpTime = DispatchTime.now()
                     self.relayRequest(
                         context: context,
-                        clientChannel: clientChannel,
+                        clientChannel: connection.channel,
                         head: head,
                         requestData: requestData,
                         graphQLInfo: graphQLInfo,
@@ -704,6 +703,8 @@ extension HTTPProxyHandler {
                         connectTime: connectTime,
                         tcpTime: tcpTime,
                         responseHeaderOperations: responseHeaderOperations,
+                        upstreamRoute: connection.route,
+                        useAbsoluteForwardURI: connection.requiresAbsoluteHTTPRequestURI,
                         onUpstreamClosed: { limiter.release(host: host, port: port) },
                         callback: callback
                     )
@@ -725,6 +726,8 @@ extension HTTPProxyHandler {
         connectTime: DispatchTime,
         tcpTime: DispatchTime,
         responseHeaderOperations: [HeaderOperation]? = nil,
+        upstreamRoute: UpstreamRoute,
+        useAbsoluteForwardURI: Bool,
         onUpstreamClosed: @escaping @Sendable () -> Void,
         callback: @escaping @Sendable (HTTPTransaction) -> Void
     ) {
@@ -740,6 +743,8 @@ extension HTTPProxyHandler {
             headerResponseOperations: responseHeaderOperations,
             scriptPluginManager: scriptPluginManager,
             onBreakpointHit: onBreakpointHit,
+            upstreamRouteSummary: upstreamRoute.summary,
+            upstreamRouteKind: upstreamRoute.kindDisplay,
             onTransactionComplete: callback,
             onChannelClosed: onUpstreamClosed
         )
@@ -754,7 +759,9 @@ extension HTTPProxyHandler {
                 // ScriptRequestContext.apply(to:pluginID:).
                 let forwardHead = ProxyHandlerShared.buildForwardHead(
                     from: requestData,
-                    originalHead: head
+                    originalHead: head,
+                    useAbsoluteURI: useAbsoluteForwardURI,
+                    upstreamProxyAuthorization: useAbsoluteForwardURI ? upstreamRoute.proxyAuthorizationHeader : nil
                 )
                 clientChannel.write(NIOAny(HTTPClientRequestPart.head(forwardHead)), promise: nil)
                 if let bodyData = requestData.body, !bodyData.isEmpty {

@@ -100,6 +100,7 @@ actor ProxyServer {
         self.scriptPluginManager = scriptPluginManager
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
+        self.upstreamProxyState = UpstreamProxyState(configuration: configuration.upstreamProxy)
     }
 
     // MARK: Internal
@@ -123,6 +124,7 @@ actor ProxyServer {
         let limiter = connectionLimiter
         let callback = onTransactionComplete
         let breakpointHit = onBreakpointHit
+        let upstreamState = upstreamProxyState
 
         let bootstrap = ServerBootstrap(group: group)
             // Backlog of 256 pending connections before the OS starts rejecting
@@ -139,6 +141,7 @@ actor ProxyServer {
                         ruleEngine: ruleEng,
                         scriptPluginManager: scriptMgr,
                         connectionLimiter: limiter,
+                        upstreamProxyState: upstreamState,
                         onTransactionComplete: callback,
                         onBreakpointHit: breakpointHit
                     )
@@ -193,6 +196,14 @@ actor ProxyServer {
         Self.logger.info("Proxy server stopped")
     }
 
+    func updateUpstreamProxy(_ configuration: UpstreamProxyConfiguration) {
+        var configuration = configuration
+        configuration.listenerHost = self.configuration.listenAddress
+        configuration.listenerPort = self.configuration.port
+        upstreamProxyState.update(configuration)
+        Self.logger.info("Updated upstream proxy configuration")
+    }
+
     // MARK: Private
 
     private static let logger = Logger(subsystem: RockxyIdentity.current.logSubsystem, category: "ProxyServer")
@@ -202,6 +213,7 @@ actor ProxyServer {
     private let ruleEngine: RuleEngine
     private let scriptPluginManager: ScriptPluginManager?
     private let connectionLimiter = ConnectionLimiter()
+    private let upstreamProxyState: UpstreamProxyState
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
         BreakpointDecision,

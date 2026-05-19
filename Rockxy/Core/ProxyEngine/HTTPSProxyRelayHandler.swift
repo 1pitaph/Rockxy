@@ -28,6 +28,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         scriptPluginManager: ScriptPluginManager? = nil,
         connectionLimiter: ConnectionLimiter,
         customCertificateManager: CustomCertificateManager = .shared,
+        upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         clientSourcePort: UInt16? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
@@ -38,6 +39,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         self.scriptPluginManager = scriptPluginManager
         self.connectionLimiter = connectionLimiter
         self.customCertificateManager = customCertificateManager
+        self.upstreamProxyState = upstreamProxyState
         self.clientSourcePort = clientSourcePort
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
@@ -106,6 +108,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private let scriptPluginManager: ScriptPluginManager?
     private let connectionLimiter: ConnectionLimiter
     private let customCertificateManager: CustomCertificateManager
+    private let upstreamProxyState: UpstreamProxyState
     private let clientSourcePort: UInt16?
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
@@ -274,52 +277,42 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         let connectTime = DispatchTime.now()
         let limiter = connectionLimiter
 
+        let routes: [UpstreamRoute]
         do {
-            let clientTLSConfig = try Self.makeClientTLSConfiguration(
-                clientIdentity: customCertificateManager.clientIdentity(for: upstreamHost)
-            )
-            let sslContext = try NIOSSLContext(configuration: clientTLSConfig)
-
-            ClientBootstrap(group: context.eventLoop)
-                .connectTimeout(.seconds(5))
-                .channelInitializer { channel in
-                    do {
-                        let sslHandler = try NIOSSLClientHandler(
-                            context: sslContext,
-                            serverHostname: self.host
-                        )
-                        return channel.pipeline.addHandler(sslHandler).flatMap {
-                            channel.pipeline.addHTTPClientHandlers()
-                        }
-                    } catch {
-                        return channel.eventLoop.makeFailedFuture(error)
-                    }
-                }
-                .connect(host: host, port: port)
-                .whenComplete { result in
-                    self.handleUpstreamConnection(
-                        result: result,
-                        context: context,
-                        head: head,
-                        requestData: requestData,
-                        graphQLInfo: graphQLInfo,
-                        startTime: startTime,
-                        connectTime: connectTime,
-                        upstreamHost: upstreamHost,
-                        upstreamPort: upstreamPort,
-                        responseHeaderOperations: responseHeaderOperations,
-                        callback: callback
-                    )
-                }
+            routes = try upstreamProxyState.routes(for: upstreamHost, port: upstreamPort, scheme: "https")
         } catch {
-            httpsRelayLogger.error("Client TLS setup failed: \(error.localizedDescription)")
+            httpsRelayLogger.error("Upstream route resolution failed: \(error.localizedDescription)")
             limiter.release(host: upstreamHost, port: upstreamPort)
             sendErrorResponse(context: context, status: 502)
+            return
+        }
+
+        UpstreamConnector.connectHTTP(
+            on: context.eventLoop,
+            targetHost: upstreamHost,
+            targetPort: upstreamPort,
+            useTLS: true,
+            routes: routes,
+            customCertificateManager: customCertificateManager
+        ).whenComplete { result in
+            self.handleUpstreamConnection(
+                result: result,
+                context: context,
+                head: head,
+                requestData: requestData,
+                graphQLInfo: graphQLInfo,
+                startTime: startTime,
+                connectTime: connectTime,
+                upstreamHost: upstreamHost,
+                upstreamPort: upstreamPort,
+                responseHeaderOperations: responseHeaderOperations,
+                callback: callback
+            )
         }
     }
 
     nonisolated private func handleUpstreamConnection(
-        result: Result<Channel, Error>,
+        result: Result<UpstreamConnectedChannel, Error>,
         context: ChannelHandlerContext,
         head: HTTPRequestHead,
         requestData: HTTPRequestData,
@@ -333,7 +326,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     ) {
         let limiter = connectionLimiter
         switch result {
-        case let .success(clientChannel):
+        case let .success(connection):
             let tcpTime = DispatchTime.now()
             let responseHandler = UpstreamResponseHandler(
                 requestData: requestData,
@@ -348,16 +341,23 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
                 headerResponseOperations: responseHeaderOperations,
                 scriptPluginManager: self.scriptPluginManager,
                 onBreakpointHit: self.onBreakpointHit,
+                upstreamRouteSummary: connection.route.summary,
+                upstreamRouteKind: connection.route.kindDisplay,
                 onTransactionComplete: callback,
                 onChannelClosed: { limiter.release(host: upstreamHost, port: upstreamPort) }
             )
             self.pendingBreakpointPhase = nil
+            let clientChannel = connection.channel
             clientChannel.pipeline.addHandler(responseHandler).whenComplete { result in
                 switch result {
                 case .success:
                     let forwardHead = ProxyHandlerShared.buildForwardHead(
                         from: requestData,
-                        originalHead: head
+                        originalHead: head,
+                        useAbsoluteURI: connection.requiresAbsoluteHTTPRequestURI,
+                        upstreamProxyAuthorization: connection.requiresAbsoluteHTTPRequestURI
+                            ? connection.route.proxyAuthorizationHeader
+                            : nil
                     )
                     clientChannel.write(NIOAny(HTTPClientRequestPart.head(forwardHead)), promise: nil)
                     if let bodyData = requestData.body, !bodyData.isEmpty {
@@ -671,85 +671,44 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         }
         let limiter = connectionLimiter
 
-        if scheme == "https" {
-            let connectTime = DispatchTime.now()
-            do {
-                let clientTLSConfig = try Self.makeClientTLSConfiguration(
-                    clientIdentity: customCertificateManager.clientIdentity(for: remoteHost)
-                )
-                let sslContext = try NIOSSLContext(configuration: clientTLSConfig)
+        let connectTime = DispatchTime.now()
+        let routes: [UpstreamRoute]
+        do {
+            routes = try upstreamProxyState.routes(for: remoteHost, port: remotePort, scheme: scheme)
+        } catch {
+            httpsRelayLogger.error("Map remote upstream route resolution failed: \(error.localizedDescription)")
+            limiter.release(host: remoteHost, port: remotePort)
+            sendErrorResponse(context: context, status: 502)
+            return
+        }
 
-                ClientBootstrap(group: context.eventLoop)
-                    .connectTimeout(.seconds(5))
-                    .channelInitializer { channel in
-                        do {
-                            let sslHandler = try NIOSSLClientHandler(
-                                context: sslContext,
-                                serverHostname: remoteHost
-                            )
-                            return channel.pipeline.addHandler(sslHandler).flatMap {
-                                channel.pipeline.addHTTPClientHandlers()
-                            }
-                        } catch {
-                            return channel.eventLoop.makeFailedFuture(error)
-                        }
-                    }
-                    .connect(host: remoteHost, port: remotePort)
-                    .whenComplete { [weak self] result in
-                        guard let self else {
-                            if case let .success(channel) = result {
-                                channel.close(promise: nil)
-                            }
-                            limiter.release(host: remoteHost, port: remotePort)
-                            return
-                        }
-                        self.handleUpstreamConnection(
-                            result: result,
-                            context: context,
-                            head: modifiedHead,
-                            requestData: modifiedRequestData,
-                            graphQLInfo: graphQLInfo,
-                            startTime: startTime,
-                            connectTime: connectTime,
-                            upstreamHost: remoteHost,
-                            upstreamPort: remotePort,
-                            callback: callback
-                        )
-                    }
-            } catch {
-                httpsRelayLogger.error("Map remote TLS setup failed: \(error.localizedDescription)")
+        UpstreamConnector.connectHTTP(
+            on: context.eventLoop,
+            targetHost: remoteHost,
+            targetPort: remotePort,
+            useTLS: scheme == "https",
+            routes: routes,
+            customCertificateManager: customCertificateManager
+        ).whenComplete { [weak self] result in
+            guard let self else {
+                if case let .success(connection) = result {
+                    connection.channel.close(promise: nil)
+                }
                 limiter.release(host: remoteHost, port: remotePort)
-                sendErrorResponse(context: context, status: 502)
+                return
             }
-        } else {
-            let connectTime = DispatchTime.now()
-            ClientBootstrap(group: context.eventLoop)
-                .connectTimeout(.seconds(5))
-                .channelInitializer { channel in
-                    channel.pipeline.addHTTPClientHandlers()
-                }
-                .connect(host: remoteHost, port: remotePort)
-                .whenComplete { [weak self] result in
-                    guard let self else {
-                        if case let .success(channel) = result {
-                            channel.close(promise: nil)
-                        }
-                        limiter.release(host: remoteHost, port: remotePort)
-                        return
-                    }
-                    self.handleUpstreamConnection(
-                        result: result,
-                        context: context,
-                        head: modifiedHead,
-                        requestData: modifiedRequestData,
-                        graphQLInfo: graphQLInfo,
-                        startTime: startTime,
-                        connectTime: connectTime,
-                        upstreamHost: remoteHost,
-                        upstreamPort: remotePort,
-                        callback: callback
-                    )
-                }
+            self.handleUpstreamConnection(
+                result: result,
+                context: context,
+                head: modifiedHead,
+                requestData: modifiedRequestData,
+                graphQLInfo: graphQLInfo,
+                startTime: startTime,
+                connectTime: connectTime,
+                upstreamHost: remoteHost,
+                upstreamPort: remotePort,
+                callback: callback
+            )
         }
     }
 

@@ -96,7 +96,9 @@ enum ProxyHandlerShared {
     /// get it recomputed from `requestData.body?.count ?? 0`.
     nonisolated static func buildForwardHead(
         from requestData: HTTPRequestData,
-        originalHead: HTTPRequestHead
+        originalHead: HTTPRequestHead,
+        useAbsoluteURI: Bool = false,
+        upstreamProxyAuthorization: String? = nil
     )
         -> HTTPRequestHead
     {
@@ -109,14 +111,22 @@ enum ProxyHandlerShared {
         }
 
         let uri: String
-        let path = requestData.url.path.isEmpty ? "/" : requestData.url.path
-        if let query = requestData.url.query, !query.isEmpty {
-            uri = "\(path)?\(query)"
+        if useAbsoluteURI {
+            uri = requestData.url.absoluteString
         } else {
-            uri = path
+            let path = requestData.url.path.isEmpty ? "/" : requestData.url.path
+            if let query = requestData.url.query, !query.isEmpty {
+                uri = "\(path)?\(query)"
+            } else {
+                uri = path
+            }
         }
 
         var headers = HTTPHeaders(requestData.headers.map { ($0.name, $0.value) })
+        headers.remove(name: "Proxy-Authorization")
+        if let upstreamProxyAuthorization {
+            headers.replaceOrAdd(name: "Proxy-Authorization", value: upstreamProxyAuthorization)
+        }
 
         // Framing policy: scripts may have mutated the body, so we must always
         // make the framing reflect the actual outgoing bytes:

@@ -38,6 +38,8 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
         scriptPluginManager: ScriptPluginManager? = nil,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? =
             nil,
+        upstreamRouteSummary: String? = nil,
+        upstreamRouteKind: String? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onChannelClosed: @escaping @Sendable () -> Void = {}
     ) {
@@ -53,6 +55,8 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
         self.headerResponseOperations = headerResponseOperations
         self.scriptPluginManager = scriptPluginManager
         self.onBreakpointHit = onBreakpointHit
+        self.upstreamRouteSummary = upstreamRouteSummary
+        self.upstreamRouteKind = upstreamRouteKind
         self.onTransactionComplete = onTransactionComplete
         self.onChannelClosed = onChannelClosed
         if let scriptPluginManager {
@@ -136,6 +140,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
             )
             transaction.sourcePort = self.sourcePort
             transaction.clientApp = Self.extractAppFromUserAgent(self.requestData.headers)
+            self.applyUpstreamMetadata(to: transaction)
             self.onTransactionComplete(transaction)
             context.close(promise: nil)
         }
@@ -313,6 +318,8 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
         BreakpointDecision,
         BreakpointRequestData
     ))?
+    private let upstreamRouteSummary: String?
+    private let upstreamRouteKind: String?
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onChannelClosed: @Sendable () -> Void
 
@@ -574,6 +581,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
                 state: .failed
             )
             transaction.sourcePort = sourcePort
+            applyUpstreamMetadata(to: transaction)
             onTransactionComplete(transaction)
             context.close(promise: nil)
         }
@@ -618,8 +626,14 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
         )
         transaction.sourcePort = sourcePort
         transaction.clientApp = Self.extractAppFromUserAgent(requestData.headers)
+        applyUpstreamMetadata(to: transaction)
 
         onTransactionComplete(transaction)
+    }
+
+    nonisolated private func applyUpstreamMetadata(to transaction: HTTPTransaction) {
+        transaction.upstreamProxySummary = upstreamRouteSummary
+        transaction.upstreamProxyKind = upstreamRouteKind
     }
 
     nonisolated private func buildTimingInfo(endTime: DispatchTime) -> TimingInfo {
