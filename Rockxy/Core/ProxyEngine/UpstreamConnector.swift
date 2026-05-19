@@ -664,16 +664,17 @@ private final class SOCKS5UpstreamConnectHandler: ChannelInboundHandler, Removab
     }
 
     private func sendConnectRequest(context: ChannelHandlerContext) {
-        var buffer = context.channel.allocator.buffer(capacity: 32 + targetHost.utf8.count)
+        let connectHost = proxy.dnsOverSocks ? targetHost : (Self.resolvedIPAddress(targetHost) ?? targetHost)
+        var buffer = context.channel.allocator.buffer(capacity: 32 + connectHost.utf8.count)
         buffer.writeBytes([0x05, 0x01, 0x00])
-        if let ipv4 = Self.ipv4Bytes(targetHost) {
+        if let ipv4 = Self.ipv4Bytes(connectHost) {
             buffer.writeInteger(UInt8(0x01))
             buffer.writeBytes(ipv4)
-        } else if let ipv6 = Self.ipv6Bytes(targetHost) {
+        } else if let ipv6 = Self.ipv6Bytes(connectHost) {
             buffer.writeInteger(UInt8(0x04))
             buffer.writeBytes(ipv6)
         } else {
-            let domain = Array(targetHost.utf8.prefix(255))
+            let domain = Array(connectHost.utf8.prefix(255))
             buffer.writeInteger(UInt8(0x03))
             buffer.writeInteger(UInt8(domain.count))
             buffer.writeBytes(domain)
@@ -698,6 +699,37 @@ private final class SOCKS5UpstreamConnectHandler: ChannelInboundHandler, Removab
         var addr = in6_addr()
         guard inet_pton(AF_INET6, stripped, &addr) == 1 else { return nil }
         return withUnsafeBytes(of: addr, Array.init)
+    }
+
+    private static func resolvedIPAddress(_ host: String) -> String? {
+        let stripped = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        guard ipv4Bytes(stripped) == nil, ipv6Bytes(stripped) == nil else {
+            return stripped
+        }
+
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = SOCK_STREAM
+
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(stripped, nil, &hints, &result) == 0, let result else {
+            return nil
+        }
+        defer { freeaddrinfo(result) }
+
+        var addressBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(
+            result.pointee.ai_addr,
+            result.pointee.ai_addrlen,
+            &addressBuffer,
+            socklen_t(addressBuffer.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        ) == 0 else {
+            return nil
+        }
+        return String(cString: addressBuffer)
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import JavaScriptCore
 
 // MARK: - UpstreamProxyConfiguration
 
@@ -34,6 +35,7 @@ struct UpstreamProxyServer: Sendable, Equatable, Codable {
     var password: String?
     var pacScript: String?
     var pacURL: URL?
+    var dnsOverSocks: Bool
 
     init(
         kind: UpstreamProxyKind,
@@ -42,7 +44,8 @@ struct UpstreamProxyServer: Sendable, Equatable, Codable {
         username: String? = nil,
         password: String? = nil,
         pacScript: String? = nil,
-        pacURL: URL? = nil
+        pacURL: URL? = nil,
+        dnsOverSocks: Bool = true
     ) {
         self.kind = kind
         self.host = host
@@ -51,6 +54,7 @@ struct UpstreamProxyServer: Sendable, Equatable, Codable {
         self.password = password
         self.pacScript = pacScript
         self.pacURL = pacURL
+        self.dnsOverSocks = dnsOverSocks
     }
 
     var proxyAuthorizationHeader: String? {
@@ -217,7 +221,9 @@ struct UpstreamRouter: Sendable {
         }
 
         var routes: [UpstreamRoute] = []
-        for proxy in configuration.proxies {
+        for configuredProxy in configuration.proxies {
+            var proxy = configuredProxy
+            proxy.dnsOverSocks = configuration.dnsOverSocks
             try validateLoop(proxy)
             switch proxy.kind {
             case .http:
@@ -296,7 +302,9 @@ enum PACProxyResolver {
         }
 
         let directive = extractReturnValue(from: script) ?? script
-        let routes = try directive
+        let urlString = Self.urlString(for: host, port: port, scheme: scheme)
+        let evaluatedDirective = evaluatePAC(script: script, url: urlString, host: host) ?? directive
+        let routes = try evaluatedDirective
             .split(separator: ";")
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
@@ -360,7 +368,70 @@ enum PACProxyResolver {
             host: split[0],
             port: port,
             username: fallbackProxy.username,
-            password: fallbackProxy.password
+            password: fallbackProxy.password,
+            dnsOverSocks: fallbackProxy.dnsOverSocks
         )
+    }
+
+    private static func urlString(for host: String, port: Int, scheme: String?) -> String {
+        let scheme = scheme?.isEmpty == false ? scheme ?? "http" : "http"
+        let defaultPort = scheme == "https" ? 443 : 80
+        let hostPart: String = if host.contains(":"), !host.hasPrefix("[") {
+            "[\(host)]"
+        } else {
+            host
+        }
+        let portPart = port == defaultPort ? "" : ":\(port)"
+        return "\(scheme)://\(hostPart)\(portPart)/"
+    }
+
+    private static func evaluatePAC(script: String, url: String, host: String) -> String? {
+        guard let context = JSContext() else { return nil }
+        installPACHelpers(in: context)
+        context.evaluateScript(script)
+        guard context.exception == nil,
+              let function = context.objectForKeyedSubscript("FindProxyForURL"),
+              !function.isUndefined
+        else {
+            return nil
+        }
+        let result = function.call(withArguments: [url, host])
+        guard context.exception == nil else { return nil }
+        return result?.toString()
+    }
+
+    private static func installPACHelpers(in context: JSContext) {
+        let isPlainHostName: @convention(block) (String) -> Bool = { host in
+            !host.contains(".")
+        }
+        let dnsDomainIs: @convention(block) (String, String) -> Bool = { host, domain in
+            host.lowercased().hasSuffix(domain.lowercased())
+        }
+        let localHostOrDomainIs: @convention(block) (String, String) -> Bool = { host, hostdom in
+            hostdom.lowercased() == host.lowercased() || hostdom.lowercased().hasPrefix("\(host.lowercased()).")
+        }
+        let shExpMatch: @convention(block) (String, String) -> Bool = { value, pattern in
+            let escaped = NSRegularExpression.escapedPattern(for: pattern)
+                .replacingOccurrences(of: "\\*", with: ".*")
+                .replacingOccurrences(of: "\\?", with: ".")
+            return value.range(of: "^\(escaped)$", options: .regularExpression) != nil
+        }
+        let dnsResolve: @convention(block) (String) -> String? = { host in
+            host
+        }
+        let isResolvable: @convention(block) (String) -> Bool = { _ in
+            true
+        }
+        let myIpAddress: @convention(block) () -> String = {
+            "127.0.0.1"
+        }
+
+        context.setObject(isPlainHostName, forKeyedSubscript: "isPlainHostName" as NSString)
+        context.setObject(dnsDomainIs, forKeyedSubscript: "dnsDomainIs" as NSString)
+        context.setObject(localHostOrDomainIs, forKeyedSubscript: "localHostOrDomainIs" as NSString)
+        context.setObject(shExpMatch, forKeyedSubscript: "shExpMatch" as NSString)
+        context.setObject(dnsResolve, forKeyedSubscript: "dnsResolve" as NSString)
+        context.setObject(isResolvable, forKeyedSubscript: "isResolvable" as NSString)
+        context.setObject(myIpAddress, forKeyedSubscript: "myIpAddress" as NSString)
     }
 }
