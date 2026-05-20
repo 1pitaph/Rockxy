@@ -125,6 +125,7 @@ actor ProxyServer {
         let callback = onTransactionComplete
         let breakpointHit = onBreakpointHit
         let upstreamState = upstreamProxyState
+        let proxyPort = configuration.port
 
         let bootstrap = ServerBootstrap(group: group)
             // Backlog of 256 pending connections before the OS starts rejecting
@@ -142,6 +143,7 @@ actor ProxyServer {
                         scriptPluginManager: scriptMgr,
                         connectionLimiter: limiter,
                         upstreamProxyState: upstreamState,
+                        proxyPort: proxyPort,
                         onTransactionComplete: callback,
                         onBreakpointHit: breakpointHit
                     )

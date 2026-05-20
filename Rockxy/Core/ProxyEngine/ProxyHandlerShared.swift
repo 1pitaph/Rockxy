@@ -63,7 +63,8 @@ enum ProxyHandlerShared {
     /// Used by both HTTP and HTTPS handlers to decorate transactions before delivery.
     nonisolated static func makeTransactionCallback(
         for matchedRule: ProxyRule?,
-        downstream: @escaping @Sendable (HTTPTransaction) -> Void
+        downstream: @escaping @Sendable (HTTPTransaction) -> Void,
+        clientAppResolver: ClientAppResolver? = nil
     )
         -> @Sendable (HTTPTransaction) -> Void
     {
@@ -73,6 +74,7 @@ enum ProxyHandlerShared {
         let matchedRulePattern = matchedRule?.matchCondition.urlPattern
 
         return { transaction in
+            clientAppResolver?.apply(to: transaction)
             transaction.matchedRuleID = matchedRuleID
             transaction.matchedRuleName = matchedRuleName
             transaction.matchedRuleActionSummary = matchedRuleActionSummary

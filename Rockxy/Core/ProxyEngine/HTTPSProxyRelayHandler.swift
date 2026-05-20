@@ -30,6 +30,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         customCertificateManager: CustomCertificateManager = .shared,
         upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         clientSourcePort: UInt16? = nil,
+        clientAppResolver: ClientAppResolver? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
     ) {
@@ -41,6 +42,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         self.customCertificateManager = customCertificateManager
         self.upstreamProxyState = upstreamProxyState
         self.clientSourcePort = clientSourcePort
+        self.clientAppResolver = clientAppResolver
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
     }
@@ -67,6 +69,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
             requestHead = head
             requestBody = context.channel.allocator.buffer(capacity: 0)
             requestStartTime = .now()
+            requestStartedAt = Date()
             accumulatedBodySize = 0
 
         case let .body(buffer):
@@ -110,6 +113,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private let customCertificateManager: CustomCertificateManager
     private let upstreamProxyState: UpstreamProxyState
     private let clientSourcePort: UInt16?
+    private let clientAppResolver: ClientAppResolver?
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
         BreakpointDecision,
@@ -121,6 +125,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     private var requestHead: HTTPRequestHead?
     private var requestBody: ByteBuffer?
     private var requestStartTime: DispatchTime?
+    private var requestStartedAt: Date?
     private var accumulatedBodySize: Int = 0
 
     nonisolated private func makeTransactionCallback(
@@ -130,7 +135,8 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
     {
         ProxyHandlerShared.makeTransactionCallback(
             for: matchedRule,
-            downstream: onTransactionComplete
+            downstream: onTransactionComplete,
+            clientAppResolver: clientAppResolver
         )
     }
 
@@ -331,6 +337,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
             let responseHandler = UpstreamResponseHandler(
                 requestData: requestData,
                 graphQLInfo: graphQLInfo,
+                startedAt: requestStartedAt ?? Date(),
                 startTime: startTime,
                 connectTime: connectTime,
                 tcpTime: tcpTime,
@@ -343,6 +350,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
                 onBreakpointHit: self.onBreakpointHit,
                 upstreamRouteSummary: connection.route.summary,
                 upstreamRouteKind: connection.route.kindDisplay,
+                clientAppResolver: clientAppResolver,
                 onTransactionComplete: callback,
                 onChannelClosed: { limiter.release(host: upstreamHost, port: upstreamPort) }
             )
@@ -528,6 +536,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
             )
             transaction.measuredDuration = requestElapsedDuration()
             transaction.sourcePort = clientSourcePort
+            applyClientAndTiming(to: transaction)
             callback(transaction)
             return
         }
@@ -551,6 +560,7 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         )
         transaction.measuredDuration = requestElapsedDuration()
         transaction.sourcePort = clientSourcePort
+        applyClientAndTiming(to: transaction)
         callback(transaction)
     }
 
@@ -738,7 +748,27 @@ final class HTTPSProxyRelayHandler: ChannelInboundHandler, @unchecked Sendable {
         )
         transaction.measuredDuration = requestElapsedDuration()
         transaction.sourcePort = clientSourcePort
+        applyClientAndTiming(to: transaction)
         callback(transaction)
+    }
+
+    nonisolated private func applyClientAndTiming(to transaction: HTTPTransaction) {
+        clientAppResolver?.apply(to: transaction)
+        if clientAppResolver == nil {
+            transaction.clientAttribution = .unresolved
+        }
+        let startedAt = requestStartedAt ?? transaction.timestamp
+        transaction.startedAt = startedAt
+        switch transaction.state {
+        case .pending, .active:
+            transaction.completedAt = nil
+        case .completed, .failed, .blocked:
+            let completedAt = Date()
+            transaction.completedAt = completedAt
+            if transaction.measuredDuration == nil {
+                transaction.measuredDuration = completedAt.timeIntervalSince(startedAt)
+            }
+        }
     }
 
     nonisolated private func sendErrorResponse(

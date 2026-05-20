@@ -27,6 +27,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
     init(
         requestData: HTTPRequestData,
         graphQLInfo: GraphQLInfo?,
+        startedAt: Date,
         startTime: DispatchTime,
         connectTime: DispatchTime,
         tcpTime: DispatchTime,
@@ -40,11 +41,13 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
             nil,
         upstreamRouteSummary: String? = nil,
         upstreamRouteKind: String? = nil,
+        clientAppResolver: ClientAppResolver? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onChannelClosed: @escaping @Sendable () -> Void = {}
     ) {
         self.requestData = requestData
         self.graphQLInfo = graphQLInfo
+        self.startedAt = startedAt
         self.startTime = startTime
         self.connectTime = connectTime
         self.tcpTime = tcpTime
@@ -57,6 +60,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
         self.onBreakpointHit = onBreakpointHit
         self.upstreamRouteSummary = upstreamRouteSummary
         self.upstreamRouteKind = upstreamRouteKind
+        self.clientAppResolver = clientAppResolver
         self.onTransactionComplete = onTransactionComplete
         self.onChannelClosed = onChannelClosed
         if let scriptPluginManager {
@@ -134,12 +138,16 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
             }
 
             let transaction = HTTPTransaction(
+                timestamp: self.startedAt,
                 request: self.requestData,
                 response: HTTPResponseData(statusCode: 504, statusMessage: "Gateway Timeout", headers: []),
                 state: .failed
             )
             transaction.sourcePort = self.sourcePort
-            transaction.clientApp = Self.extractAppFromUserAgent(self.requestData.headers)
+            transaction.startedAt = self.startedAt
+            transaction.completedAt = Date()
+            transaction.measuredDuration = transaction.completedAt?.timeIntervalSince(self.startedAt)
+            self.applyClientApp(to: transaction)
             self.applyUpstreamMetadata(to: transaction)
             self.onTransactionComplete(transaction)
             context.close(promise: nil)
@@ -304,6 +312,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
 
     private let requestData: HTTPRequestData
     private let graphQLInfo: GraphQLInfo?
+    private let startedAt: Date
     private let startTime: DispatchTime
     private let connectTime: DispatchTime
     private let tcpTime: DispatchTime
@@ -320,6 +329,7 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
     ))?
     private let upstreamRouteSummary: String?
     private let upstreamRouteKind: String?
+    private let clientAppResolver: ClientAppResolver?
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onChannelClosed: @Sendable () -> Void
 
@@ -618,17 +628,32 @@ final class UpstreamResponseHandler: ChannelInboundHandler, @unchecked Sendable 
         let timing = buildTimingInfo(endTime: endTime)
 
         let transaction = HTTPTransaction(
+            timestamp: startedAt,
             request: requestData,
             response: responseData,
             state: .completed,
             timingInfo: timing,
             graphQLInfo: graphQLInfo
         )
+        transaction.startedAt = startedAt
+        transaction.completedAt = Date()
+        transaction.measuredDuration = timing.totalDuration
         transaction.sourcePort = sourcePort
-        transaction.clientApp = Self.extractAppFromUserAgent(requestData.headers)
+        applyClientApp(to: transaction)
         applyUpstreamMetadata(to: transaction)
 
         onTransactionComplete(transaction)
+    }
+
+    nonisolated private func applyClientApp(to transaction: HTTPTransaction) {
+        clientAppResolver?.apply(
+            to: transaction,
+            fallback: Self.extractAppFromUserAgent(requestData.headers)
+        )
+        if clientAppResolver == nil {
+            transaction.clientApp = Self.extractAppFromUserAgent(requestData.headers)
+            transaction.clientAttribution = transaction.clientApp == nil ? .unresolved : .userAgent
+        }
     }
 
     nonisolated private func applyUpstreamMetadata(to transaction: HTTPTransaction) {

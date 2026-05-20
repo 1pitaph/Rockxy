@@ -12,26 +12,18 @@ final class ProcessResolver: @unchecked Sendable {
     static let shared = ProcessResolver()
 
     /// Runs a single `lsof` call against the proxy port and returns a mapping of
-    /// client source port → human-readable app name. Cached for 2 seconds to avoid
-    /// shelling out on every batch.
+    /// client source port → human-readable app name.
     func resolveProcesses(proxyPort: Int) -> [UInt16: String] {
         let now = DispatchTime.now()
-        lock.lock()
-        if let cached = cachedResult,
-           let cacheTime = cacheTimestamp,
-           Double(now.uptimeNanoseconds - cacheTime.uptimeNanoseconds) / 1_000_000_000 < cacheTTL
-        {
-            lock.unlock()
+        if let cached = cachedResult(for: proxyPort, now: now) {
             return cached
         }
-        lock.unlock()
 
         let result = queryLsof(proxyPort: proxyPort)
 
-        lock.lock()
-        cachedResult = result
-        cacheTimestamp = now
-        lock.unlock()
+        lock.withLock {
+            cachedResults[proxyPort] = CachedResult(values: result, timestamp: now)
+        }
 
         return result
     }
@@ -40,15 +32,9 @@ final class ProcessResolver: @unchecked Sendable {
     /// Safe to call from Swift actors without blocking their executor.
     func resolveProcessesAsync(proxyPort: Int) async -> [UInt16: String] {
         let now = DispatchTime.now()
-        lock.lock()
-        if let cached = cachedResult,
-           let cacheTime = cacheTimestamp,
-           Double(now.uptimeNanoseconds - cacheTime.uptimeNanoseconds) / 1_000_000_000 < cacheTTL
-        {
-            lock.unlock()
+        if let cached = cachedResult(for: proxyPort, now: now) {
             return cached
         }
-        lock.unlock()
 
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
@@ -62,7 +48,7 @@ final class ProcessResolver: @unchecked Sendable {
     /// Used as a fallback when `lsof` batch hasn't run yet.
     func resolveAppName(remotePort: UInt16) -> String? {
         lock.lock()
-        if let cached = cachedResult, let name = cached[remotePort] {
+        if let name = cachedResults.values.compactMap({ $0.values[remotePort] }).first {
             lock.unlock()
             return name
         }
@@ -74,14 +60,40 @@ final class ProcessResolver: @unchecked Sendable {
         return appNameForPID(pid)
     }
 
+    func invalidateCache() {
+        lock.withLock {
+            cachedResults.removeAll()
+        }
+    }
+
     // MARK: Private
 
     private static let logger = Logger(subsystem: RockxyIdentity.current.logSubsystem, category: "ProcessResolver")
 
     private let lock = NSLock()
-    private var cachedResult: [UInt16: String]?
-    private var cacheTimestamp: DispatchTime?
-    private let cacheTTL: Double = 5.0
+    private var cachedResults: [Int: CachedResult] = [:]
+    private let nonEmptyCacheTTL: Double = 2.0
+    private let emptyCacheTTL: Double = 0.1
+
+    private struct CachedResult {
+        var values: [UInt16: String]
+        var timestamp: DispatchTime
+    }
+
+    private func cachedResult(for proxyPort: Int, now: DispatchTime) -> [UInt16: String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let cached = cachedResults[proxyPort] else {
+            return nil
+        }
+        let elapsed = Double(now.uptimeNanoseconds - cached.timestamp.uptimeNanoseconds) / 1_000_000_000
+        let ttl = cached.values.isEmpty ? emptyCacheTTL : nonEmptyCacheTTL
+        guard elapsed < ttl else {
+            cachedResults.removeValue(forKey: proxyPort)
+            return nil
+        }
+        return cached.values
+    }
 
     /// Runs `lsof -i TCP:PORT -n -P -F pcn` and parses the output into a port→appName map.
     /// The `-F` flag produces machine-parseable output:

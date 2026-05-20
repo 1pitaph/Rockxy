@@ -34,6 +34,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
         connectionLimiter: ConnectionLimiter,
         customCertificateManager: CustomCertificateManager = .shared,
         upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
+        proxyPort: Int? = nil,
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
     ) {
@@ -43,6 +44,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
         self.connectionLimiter = connectionLimiter
         self.customCertificateManager = customCertificateManager
         self.upstreamProxyState = upstreamProxyState
+        self.clientAppResolver = ClientAppResolver(proxyPort: proxyPort)
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
     }
@@ -59,10 +61,12 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
             requestHead = head
             requestBody = context.channel.allocator.buffer(capacity: 0)
             requestStartTime = .now()
+            requestStartedAt = Date()
             accumulatedBodySize = 0
             if clientSourcePort == nil, let port = context.channel.remoteAddress?.port {
                 clientSourcePort = UInt16(port)
             }
+            clientAppResolver.startResolving(sourcePort: clientSourcePort)
 
         case let .body(buffer):
             accumulatedBodySize += buffer.readableBytes
@@ -105,6 +109,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
     private let connectionLimiter: ConnectionLimiter
     private let customCertificateManager: CustomCertificateManager
     private let upstreamProxyState: UpstreamProxyState
+    private let clientAppResolver: ClientAppResolver
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
         BreakpointDecision,
@@ -116,6 +121,7 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
     private var requestHead: HTTPRequestHead?
     private var requestBody: ByteBuffer?
     private var requestStartTime: DispatchTime?
+    private var requestStartedAt: Date?
     private var clientSourcePort: UInt16?
     private var accumulatedBodySize: Int = 0
 
@@ -126,7 +132,8 @@ final class HTTPProxyHandler: ChannelInboundHandler, RemovableChannelHandler, @u
     {
         ProxyHandlerShared.makeTransactionCallback(
             for: matchedRule,
-            downstream: onTransactionComplete
+            downstream: onTransactionComplete,
+            clientAppResolver: clientAppResolver
         )
     }
 
@@ -602,6 +609,9 @@ extension HTTPProxyHandler {
                 customCertificateManager: self.customCertificateManager,
                 upstreamProxyState: self.upstreamProxyState,
                 clientSourcePort: self.clientSourcePort,
+                clientAppResolver: self.clientAppResolver,
+                tunnelStartedAt: self.requestStartTime ?? .now(),
+                tunnelStartedDate: self.requestStartedAt ?? Date(),
                 onTransactionComplete: self.onTransactionComplete,
                 onBreakpointHit: self.onBreakpointHit
             )
@@ -734,6 +744,7 @@ extension HTTPProxyHandler {
         let responseHandler = UpstreamResponseHandler(
             requestData: requestData,
             graphQLInfo: graphQLInfo,
+            startedAt: requestStartedAt ?? Date(),
             startTime: startTime,
             connectTime: connectTime,
             tcpTime: tcpTime,
@@ -745,6 +756,7 @@ extension HTTPProxyHandler {
             onBreakpointHit: onBreakpointHit,
             upstreamRouteSummary: upstreamRoute.summary,
             upstreamRouteKind: upstreamRoute.kindDisplay,
+            clientAppResolver: clientAppResolver,
             onTransactionComplete: callback,
             onChannelClosed: onUpstreamClosed
         )
@@ -818,6 +830,7 @@ extension HTTPProxyHandler {
             )
             transaction.measuredDuration = requestElapsedDuration()
             transaction.sourcePort = clientSourcePort
+            applyClientAndTiming(to: transaction)
             callback(transaction)
             return
         }
@@ -844,6 +857,7 @@ extension HTTPProxyHandler {
         )
         transaction.measuredDuration = requestElapsedDuration()
         transaction.sourcePort = clientSourcePort
+        applyClientAndTiming(to: transaction)
         callback(transaction)
     }
 
@@ -873,6 +887,7 @@ extension HTTPProxyHandler {
         )
         transaction.measuredDuration = requestElapsedDuration()
         transaction.sourcePort = clientSourcePort
+        applyClientAndTiming(to: transaction)
         callback(transaction)
     }
 
@@ -885,7 +900,24 @@ extension HTTPProxyHandler {
         let transaction = HTTPTransaction(request: requestData, state: state)
         transaction.measuredDuration = requestElapsedDuration()
         transaction.sourcePort = clientSourcePort
+        applyClientAndTiming(to: transaction)
         callback(transaction)
+    }
+
+    nonisolated private func applyClientAndTiming(to transaction: HTTPTransaction) {
+        clientAppResolver.apply(to: transaction)
+        let startedAt = requestStartedAt ?? transaction.timestamp
+        transaction.startedAt = startedAt
+        switch transaction.state {
+        case .pending, .active:
+            transaction.completedAt = nil
+        case .completed, .failed, .blocked:
+            let completedAt = Date()
+            transaction.completedAt = completedAt
+            if transaction.measuredDuration == nil {
+                transaction.measuredDuration = completedAt.timeIntervalSince(startedAt)
+            }
+        }
     }
 
     nonisolated private func requestElapsedDuration() -> TimeInterval? {

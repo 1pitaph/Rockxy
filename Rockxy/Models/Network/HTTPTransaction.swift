@@ -43,10 +43,14 @@ final class HTTPTransaction: Identifiable, @unchecked Sendable {
     var state: TransactionState
     var timingInfo: TimingInfo?
     var measuredDuration: TimeInterval?
+    var startedAt: Date?
+    var completedAt: Date?
+    var establishmentDuration: TimeInterval?
     var webSocketConnection: WebSocketConnection?
     var graphQLInfo: GraphQLInfo?
     var sourcePort: UInt16?
     var clientApp: String?
+    var clientAttribution: ClientAppAttribution?
     var comment: String?
     var highlightColor: HighlightColor?
     var isPinned: Bool = false
@@ -71,6 +75,12 @@ final class HTTPTransaction: Identifiable, @unchecked Sendable {
         matchedRuleActionSummary = rule.action.matchedRuleActionSummary
         matchedRulePattern = rule.matchCondition.urlPattern
     }
+}
+
+enum ClientAppAttribution: String {
+    case process
+    case userAgent
+    case unresolved
 }
 
 // MARK: - GraphQLInfo

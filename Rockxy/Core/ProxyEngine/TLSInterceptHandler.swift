@@ -99,6 +99,9 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         customCertificateManager: CustomCertificateManager = .shared,
         upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         clientSourcePort: UInt16? = nil,
+        clientAppResolver: ClientAppResolver? = nil,
+        tunnelStartedAt: DispatchTime = .now(),
+        tunnelStartedDate: Date = Date(),
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
     ) {
@@ -112,6 +115,9 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         self.customCertificateManager = customCertificateManager
         self.upstreamProxyState = upstreamProxyState
         self.clientSourcePort = clientSourcePort
+        self.clientAppResolver = clientAppResolver
+        self.tunnelStartedAt = tunnelStartedAt
+        self.tunnelStartedDate = tunnelStartedDate
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
     }
@@ -122,13 +128,19 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
     typealias OutboundOut = ByteBuffer
 
     nonisolated static func makeTunnelTransaction(
+        id: UUID = UUID(),
         host: String,
         port: Int,
         statusCode: Int,
         statusMessage: String,
         state: TransactionState,
+        startedAt: Date = Date(),
+        completedAt: Date? = nil,
         sourcePort: UInt16?,
+        clientApp: String? = nil,
+        clientAttribution: ClientAppAttribution? = nil,
         measuredDuration: TimeInterval? = nil,
+        establishmentDuration: TimeInterval? = nil,
         isTLSFailure: Bool = false,
         upstreamRouteSummary: String? = nil,
         upstreamRouteKind: String? = nil
@@ -149,13 +161,19 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
             fallbackComponents.port = 443
             let fallbackURL = fallbackComponents.url ?? URL(fileURLWithPath: "/")
             return makeTunnelTransaction(
+                id: id,
                 host: fallbackURL.host ?? "invalid-tunnel.local",
                 port: fallbackURL.port ?? 443,
                 statusCode: statusCode,
                 statusMessage: statusMessage,
                 state: state,
+                startedAt: startedAt,
+                completedAt: completedAt,
                 sourcePort: sourcePort,
+                clientApp: clientApp,
+                clientAttribution: clientAttribution,
                 measuredDuration: measuredDuration,
+                establishmentDuration: establishmentDuration,
                 isTLSFailure: isTLSFailure,
                 upstreamRouteSummary: upstreamRouteSummary,
                 upstreamRouteKind: upstreamRouteKind
@@ -170,6 +188,8 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
             contentType: nil
         )
         let transaction = HTTPTransaction(
+            id: id,
+            timestamp: startedAt,
             request: requestData,
             response: HTTPResponseData(
                 statusCode: statusCode,
@@ -179,7 +199,12 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
             state: state
         )
         transaction.measuredDuration = measuredDuration
+        transaction.startedAt = startedAt
+        transaction.completedAt = completedAt
+        transaction.establishmentDuration = establishmentDuration
         transaction.sourcePort = sourcePort
+        transaction.clientApp = clientApp
+        transaction.clientAttribution = clientAttribution
         transaction.isTLSFailure = isTLSFailure
         transaction.upstreamProxySummary = upstreamRouteSummary
         transaction.upstreamProxyKind = upstreamRouteKind
@@ -195,10 +220,11 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
         prepareClientChannel: EventLoopFuture<Void>,
         enableClientAutoRead: Bool = false,
         onSuccess: @escaping @Sendable () -> Void,
+        onClose: @escaping @Sendable () -> Void = {},
         onFailure: @escaping @Sendable (Error) -> Void
     ) {
-        let toClient = RawTunnelHandler(peerChannel: clientChannel)
-        let toServer = RawTunnelHandler(peerChannel: serverChannel)
+        let toClient = RawTunnelHandler(peerChannel: clientChannel, onClosed: onClose)
+        let toServer = RawTunnelHandler(peerChannel: serverChannel, onClosed: onClose)
 
         serverChannel.pipeline.addHandler(toClient).flatMap {
             prepareClientChannel
@@ -244,13 +270,15 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
     private let customCertificateManager: CustomCertificateManager
     private let upstreamProxyState: UpstreamProxyState
     private let clientSourcePort: UInt16?
+    private let clientAppResolver: ClientAppResolver?
+    private let tunnelStartedAt: DispatchTime
+    private let tunnelStartedDate: Date
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
         BreakpointDecision,
         BreakpointRequestData
     ))?
     private var bufferedData: [NIOAny] = []
-    private let tunnelStartedAt = DispatchTime.now()
 
     /// Asynchronously fetches a per-host cert then rewires the pipeline on the event loop.
     /// The async cert generation (actor-isolated) is bridged to NIO via `makeFutureWithTask`.
@@ -352,6 +380,9 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                 customCertificateManager: self.customCertificateManager,
                 upstreamProxyState: upstreamProxyState,
                 clientSourcePort: self.clientSourcePort,
+                clientAppResolver: self.clientAppResolver,
+                tunnelStartedAt: self.tunnelStartedAt,
+                tunnelStartedDate: self.tunnelStartedDate,
                 onTransactionComplete: callback,
                 onBreakpointHit: breakpointHit
             )
@@ -442,7 +473,11 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                     statusCode: 502,
                     statusMessage: "Upstream Route Failed",
                     state: .failed,
+                    startedAt: tunnelStartedDate,
+                    completedAt: Date(),
                     sourcePort: clientSourcePort,
+                    clientApp: clientAppResolver?.preferredApp(fallback: nil).name,
+                    clientAttribution: clientAppResolver?.preferredApp(fallback: nil).attribution ?? .unresolved,
                     measuredDuration: tunnelElapsedDuration()
                 )
             )
@@ -464,25 +499,25 @@ final class TLSInterceptHandler: ChannelInboundHandler, RemovableChannelHandler,
                         limiter.release(host: host, port: port)
                     }
                     let clientChannel = context.channel
+                    let recorder = TunnelLifecycleRecorder(
+                        host: host,
+                        port: port,
+                        startedAt: self.tunnelStartedDate,
+                        startedMonotonic: self.tunnelStartedAt,
+                        sourcePort: self.clientSourcePort,
+                        clientAppResolver: self.clientAppResolver,
+                        upstreamRoute: connection.route,
+                        onTransactionComplete: self.onTransactionComplete
+                    )
                     Self.completeRawTunnelSetup(
                         serverChannel: serverChannel,
                         clientChannel: clientChannel,
                         prepareClientChannel: context.pipeline.removeHandler(context: context),
                         enableClientAutoRead: true
                     ) {
-                        self.onTransactionComplete(
-                            Self.makeTunnelTransaction(
-                                host: host,
-                                port: port,
-                                statusCode: 200,
-                                statusMessage: "Connection Established",
-                                state: .completed,
-                                sourcePort: self.clientSourcePort,
-                                measuredDuration: self.tunnelElapsedDuration(),
-                                upstreamRouteSummary: connection.route.summary,
-                                upstreamRouteKind: connection.route.kindDisplay
-                            )
-                        )
+                        recorder.recordEstablished()
+                    } onClose: {
+                        recorder.recordCompleted()
                     } onFailure: { error in
                         tlsLogger.error(
                             "Raw tunnel setup failed: \(error.localizedDescription)"
@@ -525,6 +560,9 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         customCertificateManager: CustomCertificateManager = .shared,
         upstreamProxyState: UpstreamProxyState = UpstreamProxyState(),
         clientSourcePort: UInt16? = nil,
+        clientAppResolver: ClientAppResolver? = nil,
+        tunnelStartedAt: DispatchTime = .now(),
+        tunnelStartedDate: Date = Date(),
         onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void,
         onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (BreakpointDecision, BreakpointRequestData))? = nil
     ) {
@@ -537,6 +575,9 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
         self.customCertificateManager = customCertificateManager
         self.upstreamProxyState = upstreamProxyState
         self.clientSourcePort = clientSourcePort
+        self.clientAppResolver = clientAppResolver
+        self.tunnelStartedAt = tunnelStartedAt
+        self.tunnelStartedDate = tunnelStartedDate
         self.onTransactionComplete = onTransactionComplete
         self.onBreakpointHit = onBreakpointHit
     }
@@ -562,6 +603,7 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
                 customCertificateManager: customCertificateManager,
                 upstreamProxyState: upstreamProxyState,
                 clientSourcePort: clientSourcePort,
+                clientAppResolver: clientAppResolver,
                 onTransactionComplete: onTransactionComplete,
                 onBreakpointHit: onBreakpointHit
             )
@@ -624,11 +666,15 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
                 port: port,
                 statusCode: 0,
                 statusMessage: "TLS Handshake Failed",
-                state: .failed,
-                sourcePort: clientSourcePort,
-                measuredDuration: tunnelElapsedDuration(),
-                isTLSFailure: true
-            )
+            state: .failed,
+            startedAt: tunnelStartedDate,
+            completedAt: Date(),
+            sourcePort: clientSourcePort,
+            clientApp: clientAppResolver?.preferredApp(fallback: nil).name,
+            clientAttribution: clientAppResolver?.preferredApp(fallback: nil).attribution ?? .unresolved,
+            measuredDuration: tunnelElapsedDuration(),
+            isTLSFailure: true
+        )
         )
 
         tearDownAndPassthrough(context: context)
@@ -641,8 +687,13 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
             statusCode: 200,
             statusMessage: "Connection Established",
             state: .completed,
+            startedAt: tunnelStartedDate,
+            completedAt: Date(),
             sourcePort: clientSourcePort,
+            clientApp: clientAppResolver?.preferredApp(fallback: nil).name,
+            clientAttribution: clientAppResolver?.preferredApp(fallback: nil).attribution ?? .unresolved,
             measuredDuration: tunnelElapsedDuration(),
+            establishmentDuration: tunnelElapsedDuration(),
             upstreamRouteSummary: upstreamRoute?.summary,
             upstreamRouteKind: upstreamRoute?.kindDisplay
         )
@@ -650,6 +701,19 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
 
     nonisolated func recordSuccessfulTunnel(upstreamRoute: UpstreamRoute? = nil) {
         onTransactionComplete(makeSuccessfulTunnelTransaction(upstreamRoute: upstreamRoute))
+    }
+
+    nonisolated func makeTunnelLifecycleRecorder(upstreamRoute: UpstreamRoute? = nil) -> TunnelLifecycleRecorder {
+        TunnelLifecycleRecorder(
+            host: host,
+            port: port,
+            startedAt: tunnelStartedDate,
+            startedMonotonic: tunnelStartedAt,
+            sourcePort: clientSourcePort,
+            clientAppResolver: clientAppResolver,
+            upstreamRoute: upstreamRoute,
+            onTransactionComplete: onTransactionComplete
+        )
     }
 
     // MARK: Private
@@ -665,13 +729,15 @@ final class PostHandshakeHandler: ChannelInboundHandler, RemovableChannelHandler
     private let customCertificateManager: CustomCertificateManager
     private let upstreamProxyState: UpstreamProxyState
     private let clientSourcePort: UInt16?
+    private let clientAppResolver: ClientAppResolver?
+    private let tunnelStartedAt: DispatchTime
+    private let tunnelStartedDate: Date
     private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
     private let onBreakpointHit: (@Sendable (BreakpointRequestData) async -> (
         BreakpointDecision,
         BreakpointRequestData
     ))?
     private var handshakeResolved = false
-    private let tunnelStartedAt = DispatchTime.now()
 
     /// Returns true if the error indicates the client rejected our generated certificate.
     /// BoringSSL errors are opaque strings, so we match against known alert patterns.
@@ -908,15 +974,18 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
                 serverChannel.closeFuture.whenComplete { _ in
                     limiter.release(host: host, port: port)
                 }
+                let recorder = self.postHandshake.makeTunnelLifecycleRecorder(upstreamRoute: connection.route)
                 TLSInterceptHandler.completeRawTunnelSetup(
                     serverChannel: serverChannel,
                     clientChannel: channel,
                     prepareClientChannel: channel.eventLoop.makeSucceededVoidFuture()
                 ) {
-                    self.postHandshake.recordSuccessfulTunnel(upstreamRoute: connection.route)
+                    recorder.recordEstablished()
                     // Forward the first non-TLS data to the upstream once the raw tunnel is live.
                     channel.pipeline.fireChannelRead(firstData)
                     channel.pipeline.fireChannelReadComplete()
+                } onClose: {
+                    recorder.recordCompleted()
                 } onFailure: { _ in
                     serverChannel.close(promise: nil)
                     channel.close(promise: nil)
@@ -930,6 +999,97 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
     }
 }
 
+// MARK: - TunnelLifecycleRecorder
+
+final class TunnelLifecycleRecorder: @unchecked Sendable {
+    init(
+        host: String,
+        port: Int,
+        startedAt: Date,
+        startedMonotonic: DispatchTime,
+        sourcePort: UInt16?,
+        clientAppResolver: ClientAppResolver?,
+        upstreamRoute: UpstreamRoute?,
+        onTransactionComplete: @escaping @Sendable (HTTPTransaction) -> Void
+    ) {
+        self.host = host
+        self.port = port
+        self.startedAt = startedAt
+        self.startedMonotonic = startedMonotonic
+        self.sourcePort = sourcePort
+        self.clientAppResolver = clientAppResolver
+        self.upstreamRoute = upstreamRoute
+        self.onTransactionComplete = onTransactionComplete
+    }
+
+    func recordEstablished() {
+        let shouldEmit = lock.withLock { () -> Bool in
+            guard !didEmitEstablished else { return false }
+            didEmitEstablished = true
+            establishmentDuration = elapsedSinceStart()
+            return true
+        }
+        guard shouldEmit else { return }
+
+        onTransactionComplete(makeTransaction(state: .active, completedAt: nil))
+    }
+
+    func recordCompleted() {
+        let shouldEmit = lock.withLock { () -> Bool in
+            guard !didComplete else { return false }
+            didComplete = true
+            if establishmentDuration == nil {
+                establishmentDuration = elapsedSinceStart()
+            }
+            return true
+        }
+        guard shouldEmit else { return }
+
+        onTransactionComplete(makeTransaction(state: .completed, completedAt: Date()))
+    }
+
+    private let id = UUID()
+    private let lock = NSLock()
+    private let host: String
+    private let port: Int
+    private let startedAt: Date
+    private let startedMonotonic: DispatchTime
+    private let sourcePort: UInt16?
+    private let clientAppResolver: ClientAppResolver?
+    private let upstreamRoute: UpstreamRoute?
+    private let onTransactionComplete: @Sendable (HTTPTransaction) -> Void
+    private var didEmitEstablished = false
+    private var didComplete = false
+    private var establishmentDuration: TimeInterval?
+
+    private func makeTransaction(state: TransactionState, completedAt: Date?) -> HTTPTransaction {
+        let preferred = clientAppResolver?.preferredApp(fallback: nil)
+        let measuredDuration = completedAt.map { $0.timeIntervalSince(startedAt) }
+        return TLSInterceptHandler.makeTunnelTransaction(
+            id: id,
+            host: host,
+            port: port,
+            statusCode: 200,
+            statusMessage: "Connection Established",
+            state: state,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            sourcePort: sourcePort,
+            clientApp: preferred?.name,
+            clientAttribution: preferred?.attribution ?? .unresolved,
+            measuredDuration: measuredDuration,
+            establishmentDuration: lock.withLock { establishmentDuration },
+            upstreamRouteSummary: upstreamRoute?.summary,
+            upstreamRouteKind: upstreamRoute?.kindDisplay
+        )
+    }
+
+    private func elapsedSinceStart() -> TimeInterval {
+        let elapsedNanos = DispatchTime.now().uptimeNanoseconds - startedMonotonic.uptimeNanoseconds
+        return TimeInterval(elapsedNanos) / 1_000_000_000.0
+    }
+}
+
 // MARK: - RawTunnelHandler
 
 /// Bidirectional byte-level relay between two channels. Used as a fallback when TLS
@@ -938,8 +1098,9 @@ final class ProtocolDetectorHandler: ChannelInboundHandler, RemovableChannelHand
 final class RawTunnelHandler: ChannelInboundHandler, @unchecked Sendable {
     // MARK: Lifecycle
 
-    init(peerChannel: Channel) {
+    init(peerChannel: Channel, onClosed: @escaping @Sendable () -> Void = {}) {
         self.peerChannel = peerChannel
+        self.onClosed = onClosed
     }
 
     // MARK: Internal
@@ -964,11 +1125,13 @@ final class RawTunnelHandler: ChannelInboundHandler, @unchecked Sendable {
 
     nonisolated func channelInactive(context: ChannelHandlerContext) {
         idleTimeout?.cancel()
+        onClosed()
         peerChannel.close(promise: nil)
     }
 
     nonisolated func errorCaught(context: ChannelHandlerContext, error: Error) {
         idleTimeout?.cancel()
+        onClosed()
         peerChannel.close(promise: nil)
         context.close(promise: nil)
     }
@@ -978,6 +1141,7 @@ final class RawTunnelHandler: ChannelInboundHandler, @unchecked Sendable {
     private static let idleTimeoutDuration: TimeAmount = .seconds(60)
 
     private let peerChannel: Channel
+    private let onClosed: @Sendable () -> Void
     private var idleTimeout: Scheduled<Void>?
 
     nonisolated private func resetIdleTimeout(context: ChannelHandlerContext) {
